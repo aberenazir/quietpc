@@ -55,6 +55,8 @@ namespace QuietPC
         readonly Tile updates = new Tile { Glyph = "", Caption = "Pause updates" };
         readonly Tile calm = new Tile { Glyph = "", Caption = "Calm my PC" };
         readonly Tile clean = new Tile { Glyph = "", Caption = "Clean junk files" };
+        readonly Tile scans = new Tile { Glyph = "", Caption = "Scan when I ask" };
+        readonly Tile protect = new Tile { Glyph = "", Caption = "Pause protection" };
         readonly Label busy = new Label();
         readonly Label open = new Label();
         readonly ProcessSampler sampler = new ProcessSampler();
@@ -84,13 +86,13 @@ namespace QuietPC
             Controls.Add(title);
 
             int y = pad + Theme.S(36);
-            Tile[] tiles = { quiet, updates, calm, clean };
+            Tile[] tiles = { quiet, updates, calm, clean, scans, protect };
             for (int i = 0; i < tiles.Length; i++)
             {
                 tiles[i].Bounds = new Rectangle(pad + (i % 2) * (tileW + gap), y + (i / 2) * (tileH + gap), tileW, tileH);
                 Controls.Add(tiles[i]);
             }
-            y += tileH * 2 + gap + Theme.S(16);
+            y += tileH * 3 + gap * 2 + Theme.S(16);
 
             busy.Location = new Point(pad, y);
             busy.Size = new Size(ClientSize.Width - pad * 2, Theme.S(86));
@@ -114,6 +116,8 @@ namespace QuietPC
             updates.Click += async delegate { await TogglePause(); };
             calm.Click += async delegate { await CalmNow(); };
             clean.Click += async delegate { await CleanFiles(); };
+            scans.Click += async delegate { await ToggleScans(); };
+            protect.Click += async delegate { await ToggleProtection(); };
 
             timer.Interval = 2000;
             timer.Tick += async delegate { await SampleBusy(); };
@@ -182,7 +186,7 @@ namespace QuietPC
 
         public async void RefreshTiles()
         {
-            bool q = false, qPlug = false, calmOn = false;
+            bool q = false, qPlug = false, calmOn = false, scansOn = false;
             DateTime? until = null;
             try
             {
@@ -193,6 +197,7 @@ namespace QuietPC
                     qPlug = plug != null && plug.IsOn();
                     until = PauseUpdatesTweak.PausedUntil();
                     calmOn = Engine.IsCalm;
+                    scansOn = Catalog.Find("defender-on-demand").IsOn();
                 });
             }
             catch (Exception ex) { Log.Write("flyout refresh: " + ex.Message); }
@@ -204,7 +209,51 @@ namespace QuietPC
             calm.On = calmOn;
             calm.Sub = calmOn ? "Done ✔" : "Everything at once";
             if (clean.Sub.Length == 0) clean.Sub = "Temp and leftover files";
-            foreach (Tile t in new[] { quiet, updates, calm, clean }) t.Invalidate();
+            scans.On = scansOn;
+            scans.Sub = scansOn ? "On: no surprise scans" : "Off: Windows decides";
+            DateTime? back = DefenderControl.ResumeAt;
+            protect.On = back != null;
+            protect.Sub = back != null ? "Back on at " + back.Value.ToString("HH:mm", CultureInfo.CurrentCulture) : "For " + PauseText();
+            foreach (Tile t in new[] { quiet, updates, calm, clean, scans, protect }) t.Invalidate();
+        }
+
+        static string PauseText()
+        {
+            int m = DefenderControl.PauseMinutes;
+            return m < 60 ? m + " minutes" : m == 60 ? "1 hour" : (m / 60) + " hours";
+        }
+
+        Task ToggleScans()
+        {
+            bool turnOn = !scans.On;
+            Tweak t = Catalog.Find("defender-on-demand");
+            return Run(scans, delegate { if (turnOn) Engine.Apply(t); else Engine.Revert(t); });
+        }
+
+        async Task ToggleProtection()
+        {
+            bool pausing = !protect.On;
+            string error = null;
+            bool resumed = true;
+            await Run(protect, delegate
+            {
+                if (pausing) error = DefenderControl.Pause(DefenderControl.PauseMinutes);
+                else resumed = DefenderControl.Resume();
+            });
+            if (IsDisposed) return;
+            anyBusy = true; // keep the panel open while a message shows
+            if (error == DefenderControl.TamperBlocked)
+            {
+                if (MessageBox.Show(this, DefenderControl.TamperHelp, "QuietPC", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+                {
+                    anyBusy = false;
+                    Hide(); // get out of the way of Windows Security
+                    DefenderControl.OpenSettings();
+                }
+            }
+            else if (error != null) MessageBox.Show(this, error, "QuietPC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            else if (!resumed) MessageBox.Show(this, "Windows didn't turn protection back on. Open Windows Security and switch on Real-time protection.", "QuietPC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            anyBusy = false;
         }
 
         async Task Run(Tile tile, Action work)

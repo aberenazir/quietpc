@@ -100,6 +100,9 @@ namespace QuietPC
         readonly System.Windows.Forms.Timer reminderTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer updateTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer promoteTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer protectionTimer = new System.Windows.Forms.Timer();
+        bool resuming, resumeFailNotified;
+        DateTime nextResumeTry = DateTime.MinValue;
         readonly ToolStripMenuItem installUpdateItem;
         readonly EventWaitHandle showSignal;
         readonly RegisteredWaitHandle showWait;
@@ -161,6 +164,12 @@ namespace QuietPC
             reminderTimer.Tick += delegate { RemindAboutUpdates(); };
             reminderTimer.Start();
 
+            // Paused Windows Security protection comes back on by itself when its time is up
+            // (also right after start, in case the laptop was off or asleep at that moment).
+            protectionTimer.Interval = 20000;
+            protectionTimer.Tick += delegate { ResumeProtectionIfDue(); };
+            protectionTimer.Start();
+
             // QuietPC's own updates: shortly after start, then every 6 hours.
             updateTimer.Interval = 30000;
             updateTimer.Tick += delegate
@@ -179,6 +188,34 @@ namespace QuietPC
 
             if (justUpdated) Balloon("QuietPC updated", "You now have version " + AppInfo.Version + ".", "");
             if (showWindow) OpenMain("home");
+        }
+
+        void ResumeProtectionIfDue()
+        {
+            if (resuming || !DefenderControl.ResumeDue || DateTime.UtcNow < nextResumeTry) return;
+            resuming = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                bool ok = false;
+                try { ok = DefenderControl.Resume(); } catch (Exception ex) { Log.Write("resume protection: " + ex.Message); }
+                RunOnUi(delegate
+                {
+                    resuming = false;
+                    if (ok)
+                    {
+                        resumeFailNotified = false;
+                        Balloon("Protection is back on", "Windows Security is protecting you again.", "");
+                    }
+                    else
+                    {
+                        nextResumeTry = DateTime.UtcNow.AddMinutes(10); // try again later, quietly
+                        if (!resumeFailNotified)
+                            Balloon("Protection is still paused", "QuietPC couldn't turn it back on. Open Windows Security and switch on Real-time protection.", "");
+                        resumeFailNotified = true;
+                    }
+                    if (flyout.Visible) flyout.RefreshTiles();
+                });
+            });
         }
 
         void RunOnUi(Action a)
@@ -329,6 +366,10 @@ namespace QuietPC
                 Exception error = null;
                 try { path = Updater.Download(info); }
                 catch (Exception ex) { error = ex; }
+                if (error == null && DefenderControl.IsPaused)
+                {
+                    try { DefenderControl.Resume(); } catch (Exception ex) { Log.Write("resume before update: " + ex.Message); }
+                }
                 RunOnUi(delegate
                 {
                     if (error != null)
@@ -363,6 +404,9 @@ namespace QuietPC
                 if (showWait != null) showWait.Unregister(null);
                 reminderTimer.Stop();
                 updateTimer.Stop();
+                protectionTimer.Stop();
+                // Never leave protection paused when QuietPC isn't running to turn it back on.
+                if (DefenderControl.IsPaused) DefenderControl.Resume();
                 promoteTimer.Stop();
                 tray.Visible = false;
                 tray.Dispose();
@@ -628,6 +672,8 @@ namespace QuietPC
 
             CloseRunningCopies();
             List<string> failed = new List<string>();
+            if (DefenderControl.IsPaused && !DefenderControl.Resume())
+                failed.Add("Windows Security protection (turn it on in Windows Security)");
             if (answer == DialogResult.Yes)
             {
                 using (Form wait = new Form())

@@ -592,4 +592,207 @@ namespace QuietPC
             return false;
         }
     }
+
+    // ------------------------------------------------------------------ windows security
+
+    class DefenderStatus
+    {
+        public bool Known;       // the status could be read
+        public bool Active;      // Windows Security is the antivirus
+        public bool RealTime;    // real-time protection on
+        public bool Tamper;      // Tamper Protection on (blocks pausing)
+        public string LastQuickScan = "";
+    }
+
+    static class DefenderControl
+    {
+        public const string TamperBlocked = "TAMPER";
+        const string SafetyTask = "QuietPC-ResumeProtection";
+
+        public static DefenderStatus Status()
+        {
+            DefenderStatus st = new DefenderStatus();
+            Shell.Result r = Shell.PowerShell(
+                "$s = Get-MpComputerStatus -ErrorAction Stop; '{0}|{1}|{2}|{3}' -f [int]$s.AntivirusEnabled, [int]$s.RealTimeProtectionEnabled, [int]$s.IsTamperProtected, " +
+                "$(if ($s.QuickScanEndTime) { $s.QuickScanEndTime.ToString('d MMM yyyy, HH:mm') } else { '' })", 60000);
+            string[] p = r.Output.Trim().Split('|');
+            if (!r.Ok || p.Length < 4) return st;
+            st.Known = true;
+            st.Active = p[0] == "1";
+            st.RealTime = p[1] == "1";
+            st.Tamper = p[2] == "1";
+            st.LastQuickScan = p[3].Trim();
+            return st;
+        }
+
+        public static int PauseMinutes
+        {
+            get { int m; return int.TryParse(Store.Get("rtpMinutes", "60"), out m) && m > 0 ? m : 60; }
+            set { Store.Set("rtpMinutes", value.ToString(CultureInfo.InvariantCulture)); }
+        }
+
+        public static bool IsPaused { get { return Store.Get("rtpResumeAt").Length > 0; } }
+
+        static DateTime? Read(string key)
+        {
+            DateTime t;
+            if (DateTime.TryParse(Store.Get(key), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out t)) return t.ToUniversalTime();
+            return null;
+        }
+
+        public static DateTime? ResumeAt
+        {
+            get { DateTime? t = Read("rtpResumeAt"); return t == null ? (DateTime?)null : t.Value.ToLocalTime(); }
+        }
+
+        // Time to turn protection back on? Also yes if the clock was moved, so a pause can never stretch.
+        public static bool ResumeDue
+        {
+            get
+            {
+                DateTime? at = Read("rtpResumeAt");
+                if (at == null) return false;
+                DateTime now = DateTime.UtcNow;
+                DateTime? started = Read("rtpPausedAt");
+                if (now >= at.Value) return true;
+                if (started != null && now < started.Value.AddMinutes(-2)) return true;               // clock moved back
+                if (started != null && at.Value - now > at.Value - started.Value + TimeSpan.FromMinutes(10)) return true; // longer than chosen
+                return false;
+            }
+        }
+
+        // Returns null when paused, TamperBlocked when Windows needs Tamper Protection switched off first, or a message.
+        public static string Pause(int minutes)
+        {
+            DefenderStatus st = Status();
+            if (!st.Known) return "QuietPC couldn't read Windows Security's status. Please try again.";
+            if (!st.Active) return "Windows Security isn't the antivirus on this PC.";
+            if (st.Tamper) return TamperBlocked;
+
+            DateTime now = DateTime.UtcNow, at = now.AddMinutes(minutes);
+            // Remember the pause and set up Windows' own safety net BEFORE switching anything off.
+            if (!Store.Set("rtpPausedAt", now.ToString("o", CultureInfo.InvariantCulture)) ||
+                !Store.Set("rtpResumeAt", at.ToString("o", CultureInfo.InvariantCulture)) ||
+                !CreateSafetyTask(at.ToLocalTime()))
+            {
+                Store.Set("rtpResumeAt", null);
+                Store.Set("rtpPausedAt", null);
+                DeleteSafetyTask();
+                return "QuietPC couldn't set up the automatic turn-back-on, so it didn't pause protection.";
+            }
+
+            Shell.PowerShell("Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop");
+            for (int i = 0; i < 6; i++)
+            {
+                DefenderStatus now2 = Status();
+                if (now2.Known && !now2.RealTime)
+                {
+                    Log.Write("protection paused for " + minutes + " min");
+                    return null;
+                }
+                System.Threading.Thread.Sleep(2000);
+            }
+            Resume();
+            return "Windows didn't allow pausing protection. Check that Tamper Protection is off in Windows Security.";
+        }
+
+        // Only reports success when Windows confirms protection is on again; otherwise the pause stays
+        // remembered (and Windows' safety task stays) so it's tried again.
+        public static bool Resume()
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                Shell.PowerShell("Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop");
+                DefenderStatus st = Status();
+                if (st.Known && (st.RealTime || !st.Active))
+                {
+                    Store.Set("rtpResumeAt", null);
+                    Store.Set("rtpPausedAt", null);
+                    DeleteSafetyTask();
+                    Log.Write("protection back on");
+                    return true;
+                }
+                System.Threading.Thread.Sleep(1500);
+            }
+            Log.Write("protection resume not confirmed yet");
+            return false;
+        }
+
+        // A Windows scheduled task (runs as SYSTEM, even if QuietPC is closed or crashed) that turns
+        // protection back on at the resume time and at the next start of the PC, then deletes itself.
+        static bool CreateSafetyTask(DateTime resumeLocal)
+        {
+            string ps = Paths.System32(@"WindowsPowerShell\v1.0\powershell.exe");
+            // Keeps trying for ~7 minutes; only deletes itself once Windows confirms protection is on
+            // (the task also repeats every 15 minutes until then).
+            string command =
+                "for ($i = 0; $i -lt 30; $i++) { " +
+                "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue; " +
+                "$s = Get-MpComputerStatus -ErrorAction SilentlyContinue; " +
+                "if ($s -and ($s.RealTimeProtectionEnabled -or -not $s.AntivirusEnabled)) { & '" + Paths.System32("schtasks.exe") + "' /Delete /TN " + SafetyTask + " /F; exit 0 }; " +
+                "Start-Sleep -Seconds 15 }; exit 1";
+            string args = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + command + "\"";
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <RegistrationInfo><Description>Turns Windows Security protection back on after a QuietPC pause.</Description></RegistrationInfo>\r\n" +
+                "  <Triggers>\r\n" +
+                "    <TimeTrigger><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><StartBoundary>" +
+                resumeLocal.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture) + "</StartBoundary><Enabled>true</Enabled></TimeTrigger>\r\n" +
+                "    <BootTrigger><Repetition><Interval>PT15M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition><Enabled>true</Enabled></BootTrigger>\r\n" +
+                "  </Triggers>\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <AllowHardTerminate>true</AllowHardTerminate>\r\n" +
+                "    <StartWhenAvailable>true</StartWhenAvailable>\r\n" +
+                "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n" +
+                "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "    <Hidden>false</Hidden>\r\n" +
+                "    <WakeToRun>false</WakeToRun>\r\n" +
+                "    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>\r\n" +
+                "    <Priority>4</Priority>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>" + System.Security.SecurityElement.Escape(ps) + "</Command><Arguments>" +
+                System.Security.SecurityElement.Escape(args) + "</Arguments></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+            Paths.EnsureDataDir();
+            string file = Path.Combine(Paths.DataDir, "resume-task.xml");
+            try
+            {
+                File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+                return Shell.Run(Paths.System32("schtasks.exe"), "/Create /TN " + SafetyTask + " /XML \"" + file + "\" /F", 15000).Ok;
+            }
+            catch (Exception ex) { Log.Write("safety task: " + ex.Message); return false; }
+            finally { try { File.Delete(file); } catch { } }
+        }
+
+        static void DeleteSafetyTask()
+        {
+            if (Shell.Run(Paths.System32("schtasks.exe"), "/Query /TN " + SafetyTask, 15000).Ok)
+                Shell.Run(Paths.System32("schtasks.exe"), "/Delete /TN " + SafetyTask + " /F", 15000);
+        }
+
+        public static bool Scan(bool full)
+        {
+            Log.Write((full ? "full" : "quick") + " scan started");
+            return Shell.PowerShell("Start-MpScan -ScanType " + (full ? "FullScan" : "QuickScan") + " -ErrorAction Stop", 6 * 60 * 60 * 1000).Ok;
+        }
+
+        public static void OpenSettings()
+        {
+            try { Process.Start("windowsdefender://threatsettings"); }
+            catch { try { Process.Start("windowsdefender:"); } catch { } }
+        }
+
+        public const string TamperHelp =
+            "Windows only lets apps pause protection after you switch off \"Tamper Protection\" yourself (Microsoft blocks every app from doing that part).\n\n" +
+            "In the window that opens: Virus & threat protection settings > Tamper Protection > Off.\n" +
+            "Then come back and press Pause again.\n\n" +
+            "Note: with Tamper Protection off, other programs could change Windows Security too. You can turn it back on any time on that same page.\n\n" +
+            "Open Windows Security now?";
+    }
 }

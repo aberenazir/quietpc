@@ -16,7 +16,7 @@ namespace QuietPC
     static class AppInfo
     {
         public const string Name = "QuietPC";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
         public const string Repo = "aberenazir/quietpc";
         public const string VersionUrl = "https://github.com/" + Repo + "/releases/latest/download/version.txt";
 
@@ -254,7 +254,8 @@ namespace QuietPC
             }
         }
 
-        public static void Set(string key, string value)
+        // Returns false if it couldn't be saved to disk.
+        public static bool Set(string key, string value)
         {
             lock (gate)
             {
@@ -266,8 +267,9 @@ namespace QuietPC
                     List<string> lines = new List<string>();
                     foreach (KeyValuePair<string, string> kv in values) lines.Add(kv.Key + "=" + kv.Value);
                     File.WriteAllLines(FilePath, lines.ToArray());
+                    return true;
                 }
-                catch (Exception ex) { Log.Write("settings save: " + ex.Message); }
+                catch (Exception ex) { Log.Write("settings save: " + ex.Message); return false; }
             }
         }
     }

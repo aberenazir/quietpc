@@ -32,6 +32,7 @@ namespace QuietPC
             { "home", "", "Home" },
             { "updates", "", "Updates" },
             { "fan", "", "Fan & battery" },
+            { "security", "", "Windows Security" },
             { "startup", "", "Startup apps" },
             { "cleanup", "", "Clean up Windows" },
             { "junk", "", "Remove junk apps" },
@@ -137,6 +138,7 @@ namespace QuietPC
             {
                 case "updates": BuildUpdates(page); break;
                 case "fan": BuildFan(page); break;
+                case "security": BuildSecurity(page); break;
                 case "startup": BuildStartup(page); break;
                 case "cleanup": BuildCleanup(page); break;
                 case "junk": BuildJunk(page); break;
@@ -462,6 +464,122 @@ namespace QuietPC
                 catch { }
             }
             Log.Write("ended " + item.Key);
+        }
+
+        // ------------------------------------------------------------------ windows security
+
+        void BuildSecurity(Stack p)
+        {
+            p.Heading("Windows Security", Theme.PageTitle);
+            p.Note("You decide when your antivirus does heavy work. Real-time protection (checking files as you open or download them) is light and is what keeps viruses out, so only pause it for short times.");
+
+            Row status = new Row { Title = "Checking Windows Security...", Description = "" };
+            p.Controls.Add(status);
+
+            TweakRow(p, Catalog.Find("defender-on-demand"));
+
+            Row pause = new Row
+            {
+                Title = "Pause protection",
+                Description = "Turns real-time protection off for a while (for example during a game or a big copy). It turns itself back on.",
+                Warning = "While paused, nothing checks what you download or open. Avoid downloading things."
+            };
+            ToggleSwitch pauseSwitch = new ToggleSwitch();
+            pauseSwitch.Busy = true;
+            pause.Trailing = pauseSwitch;
+            p.Controls.Add(pause);
+
+            Row howLong = new Row { Title = "Pause for", Description = "Protection comes back on by itself after this." };
+            ComboBox combo = new ComboBox();
+            combo.DropDownStyle = ComboBoxStyle.DropDownList;
+            combo.FlatStyle = FlatStyle.Flat;
+            combo.BackColor = Theme.Card;
+            combo.ForeColor = Theme.Text;
+            combo.Width = Theme.S(150);
+            int[] minutes = { 30, 60, 240 };
+            combo.Items.AddRange(new object[] { "30 minutes", "1 hour", "4 hours" });
+            int mi = Array.IndexOf(minutes, DefenderControl.PauseMinutes);
+            combo.SelectedIndex = mi >= 0 ? mi : 1;
+            combo.SelectedIndexChanged += delegate { DefenderControl.PauseMinutes = minutes[combo.SelectedIndex]; };
+            howLong.Trailing = combo;
+            p.Controls.Add(howLong);
+
+            pauseSwitch.Toggled += async delegate(bool wanted)
+            {
+                pauseSwitch.Busy = true;
+                string error = null;
+                bool resumed = true;
+                if (wanted) error = await Task.Run(delegate { return DefenderControl.Pause(DefenderControl.PauseMinutes); });
+                else resumed = await Task.Run(delegate { return DefenderControl.Resume(); });
+                if (pause.IsDisposed) return;
+                if (error == DefenderControl.TamperBlocked)
+                {
+                    if (Dialogs.Ask(this, DefenderControl.TamperHelp) == DialogResult.Yes) DefenderControl.OpenSettings();
+                }
+                else if (error != null) Dialogs.Problem(this, error);
+                else if (!resumed) Dialogs.Problem(this, "Windows didn't turn protection back on. Open Windows Security and switch on Real-time protection.");
+                app.RefreshTraySoon();
+                await RefreshSecurity(status, pause, pauseSwitch);
+            };
+
+            ButtonBar bar = new ButtonBar();
+            FlatBtn quick = bar.Add("Quick scan now", true, null);
+            FlatBtn full = bar.Add("Full scan now", false, null);
+            bar.Add("Open Windows Security", false, delegate { DefenderControl.OpenSettings(); });
+            p.Controls.Add(bar);
+            Label scanNote = p.Note("A quick scan takes a few minutes; a full scan can take an hour or more. You can keep working.");
+
+            EventHandler scan = null;
+            scan = async delegate(object sender, EventArgs e)
+            {
+                bool isFull = sender == full;
+                FlatBtn btn = (FlatBtn)sender;
+                await Busy(btn, async delegate
+                {
+                    if (!scanNote.IsDisposed) scanNote.Text = (isFull ? "Full" : "Quick") + " scan running... you can keep working or close this window.";
+                    bool ok = await Task.Run(delegate { return DefenderControl.Scan(isFull); });
+                    if (scanNote.IsDisposed) return;
+                    scanNote.Text = ok ? "✔ Scan finished. Windows Security tells you if it found anything." : "The scan couldn't run (is Windows Security your antivirus?).";
+                    await RefreshSecurity(status, pause, pauseSwitch);
+                });
+            };
+            quick.Click += scan;
+            full.Click += scan;
+
+            RefreshSecurityAsync(status, pause, pauseSwitch);
+        }
+
+        async void RefreshSecurityAsync(Row status, Row pause, ToggleSwitch sw) { await RefreshSecurity(status, pause, sw); }
+
+        async Task RefreshSecurity(Row status, Row pause, ToggleSwitch sw)
+        {
+            DefenderStatus st = await Task.Run(delegate { return DefenderControl.Status(); });
+            if (status.IsDisposed) return;
+            sw.Enabled = !st.Known || st.Active;
+            if (!st.Known)
+            {
+                status.Title = "Couldn't read Windows Security's status";
+                status.Description = "Try again in a moment.";
+            }
+            else if (!st.Active)
+            {
+                status.Title = "Windows Security isn't your antivirus";
+                status.Description = "Another antivirus is installed, so these settings don't apply. Use that antivirus's own settings.";
+            }
+            else
+            {
+                status.Title = st.RealTime ? "✔  Protection is on" : "Protection is paused";
+                DateTime? until = DefenderControl.ResumeAt;
+                status.Description = "Real-time protection: " + (st.RealTime ? "on" : "off" + (until != null ? " (back on at " + until.Value.ToString("HH:mm", CultureInfo.CurrentCulture) + ")" : "")) +
+                                     "\nTamper Protection: " + (st.Tamper ? "on (pausing needs it off)" : "off") +
+                                     "\nLast quick scan: " + (st.LastQuickScan.Length > 0 ? st.LastQuickScan : "never");
+            }
+            status.Fit();
+            sw.On = st.Known ? st.Active && !st.RealTime : DefenderControl.IsPaused;
+            sw.Busy = false;
+            pause.Status = sw.On && DefenderControl.ResumeAt != null ? "Back on at " + DefenderControl.ResumeAt.Value.ToString("HH:mm", CultureInfo.CurrentCulture) : "";
+            pause.StatusColor = Theme.Warn;
+            pause.Fit();
         }
 
         // ------------------------------------------------------------------ startup apps

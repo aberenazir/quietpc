@@ -9,7 +9,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Product>QuietPC</Product>
     <AssemblyTitle>QuietPC - calm Windows down</AssemblyTitle>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Optimize>true</Optimize>
     <DebugType>none</DebugType>
     <PlatformTarget>AnyCPU</PlatformTarget>

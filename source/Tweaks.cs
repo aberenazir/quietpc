@@ -15,6 +15,7 @@ namespace QuietPC
         public const string Updates = "updates";
         public const string Fan = "fan";
         public const string Cleanup = "cleanup";
+        public const string Security = "security";
     }
 
     abstract class Tweak
@@ -336,7 +337,8 @@ namespace QuietPC
                 bool? e = Enabled(t);
                 if (e == null) continue;
                 Backup.SaveOnce(Key(t), e.Value ? "1" : "0");
-                if (e.Value) Shell.Run(Paths.System32("schtasks.exe"), "/Change /TN \"" + t + "\" /Disable", 15000);
+                if (e.Value && !Shell.Run(Paths.System32("schtasks.exe"), "/Change /TN \"" + t + "\" /Disable", 15000).Ok)
+                    Backup.Remove(Key(t)); // Windows protects this task: nothing changed, nothing to undo
             }
         }
 
@@ -346,8 +348,8 @@ namespace QuietPC
             {
                 string original;
                 if (!Backup.TryGet(Key(t), out original)) continue;
-                bool ok = original != "1" || Shell.Run(Paths.System32("schtasks.exe"), "/Change /TN \"" + t + "\" /Enable", 15000).Ok
-                          || Enabled(t) == null; // task no longer exists: nothing to restore
+                bool ok = original != "1" || Shell.Run(Paths.System32("schtasks.exe"), "/Change /TN \"" + t + "\" /Enable", 15000).Ok;
+                if (!ok) { bool? now = Enabled(t); ok = now == null || now.Value; } // gone, or already back on
                 if (ok) Backup.Remove(Key(t));
             }
         }
@@ -499,6 +501,63 @@ namespace QuietPC
                                  " -ScanOnlyIfIdleEnabled $" + (p[2] == "1" ? "true" : "false") + " -ErrorAction Stop");
                 if (!r.Ok) throw new Exception("Windows Security didn't allow putting the scan settings back.");
             }
+            Backup.Remove(Key);
+        }
+    }
+
+    // Windows Security only scans when you ask: no scheduled scans, no catch-up scans, and its
+    // background maintenance tasks are switched off. Real-time protection stays on.
+    class DefenderOnDemandTweak : Tweak
+    {
+        string Key { get { return Id + "|defender"; } }
+
+        TaskTweak Tasks()
+        {
+            TaskTweak t = new TaskTweak();
+            t.Id = Id + ".tasks";
+            t.Add(@"\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan")
+             .Add(@"\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance")
+             .Add(@"\Microsoft\Windows\Windows Defender\Windows Defender Cleanup")
+             .Add(@"\Microsoft\Windows\Windows Defender\Windows Defender Verification");
+            return t;
+        }
+
+        public override bool IsOn() { return Backup.Has(Key); }
+
+        public override bool HasBackup() { return base.HasBackup() || Backup.HasPrefix(Id + ".tasks|"); }
+
+        public override void Apply()
+        {
+            Shell.Result r = Shell.PowerShell(
+                "$p = Get-MpPreference -ErrorAction Stop; '{0}|{1}|{2}' -f [int]$p.ScanScheduleDay, [int]$p.DisableCatchupQuickScan, [int]$p.DisableCatchupFullScan");
+            string line = r.Output.Trim();
+            if (!r.Ok || line.Split('|').Length != 3)
+                throw new Exception("Windows Security isn't the antivirus on this PC, so there's nothing to change here.");
+            Backup.SaveOnce(Key, line);
+            Shell.Result set = Shell.PowerShell("Set-MpPreference -ScanScheduleDay 8 -DisableCatchupQuickScan $true -DisableCatchupFullScan $true -ErrorAction Stop");
+            Shell.Result check = Shell.PowerShell("[int](Get-MpPreference).ScanScheduleDay");
+            if (!set.Ok || check.Output.Trim() != "8")
+            {
+                // Put back anything that did change, then forget the backup.
+                try { Revert(); } catch (Exception ex) { Log.Write("defender undo after failed change: " + ex.Message); }
+                if (!Backup.Has(Key)) throw new Exception("Windows Security didn't allow the change.");
+                throw new Exception("Windows Security didn't allow the change. QuietPC kept the original values so \"Undo everything\" can restore them.");
+            }
+            try { Tasks().Apply(); } catch (Exception ex) { Log.Write("defender tasks: " + ex.Message); }
+        }
+
+        public override void Revert()
+        {
+            try { Tasks().Revert(); } catch (Exception ex) { Log.Write("defender tasks revert: " + ex.Message); }
+            string original;
+            if (!Backup.TryGet(Key, out original)) return;
+            string[] p = original.Split('|');
+            int day;
+            if (p.Length != 3 || !int.TryParse(p[0], out day) || day < 0 || day > 8) day = 0;
+            Shell.Result r = Shell.PowerShell("Set-MpPreference -ScanScheduleDay " + day +
+                " -DisableCatchupQuickScan $" + (p.Length == 3 && p[1] == "1" ? "true" : "false") +
+                " -DisableCatchupFullScan $" + (p.Length == 3 && p[2] == "1" ? "true" : "false") + " -ErrorAction Stop");
+            if (!r.Ok) throw new Exception("Windows Security didn't allow putting the scan schedule back.");
             Backup.Remove(Key);
         }
     }
@@ -735,6 +794,11 @@ namespace QuietPC
                 "No \"finish setting up\" nags",
                 "Stops the full-screen \"Let's finish setting up your device\" screens and suggestion pop-ups.");
 
+            Add(new DefenderOnDemandTweak(), "defender-on-demand", Sections.Security, false,
+                "Only scan when I ask",
+                "Windows Security stops its scheduled and background scans. Press \"Scan now\" whenever you want one. Real-time protection (checking files as you open them) stays on.",
+                "Do a quick scan now and then, for example once a week.");
+
             Add(new ClassicMenuTweak(), "classic-menu", Sections.Cleanup, false,
                 "Full right-click menu",
                 "Right-click shows every option straight away, without \"Show more options\".");
@@ -837,6 +901,11 @@ namespace QuietPC
         public static List<string> UndoEverything(Action<string> progress)
         {
             List<string> failed = new List<string>();
+            if (DefenderControl.IsPaused)
+            {
+                if (progress != null) progress("Turning Windows Security protection back on...");
+                if (!DefenderControl.Resume()) failed.Add("Windows Security protection (turn it on in Windows Security)");
+            }
             try { Backup.EnsureReadable(); }
             catch
             {
