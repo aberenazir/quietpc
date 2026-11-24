@@ -495,8 +495,8 @@ namespace QuietPC
 
         public static string FullReport()
         {
-            string path = Path.Combine(Paths.DataDir, "battery-report.html");
-            Directory.CreateDirectory(Paths.DataDir);
+            // In your own temp folder, so your normal (non-admin) browser can open it.
+            string path = Path.Combine(Path.GetTempPath(), "QuietPC-battery-report.html");
             Shell.Run(Paths.System32("powercfg.exe"), "/batteryreport /output \"" + path + "\"", 60000);
             return File.Exists(path) ? path : null;
         }
@@ -549,10 +549,37 @@ namespace QuietPC
             }
             string explorer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
             const string task = "QuietPC-RestartExplorer";
-            Shell.Run(Paths.System32("schtasks.exe"), "/Create /TN " + task + " /TR \"" + explorer + "\" /SC ONCE /ST 00:00 /RL LIMITED /IT /F", 15000);
-            Shell.Run(Paths.System32("schtasks.exe"), "/Run /TN " + task, 15000);
-            System.Threading.Thread.Sleep(2000);
-            Shell.Run(Paths.System32("schtasks.exe"), "/Delete /TN " + task + " /F", 15000);
+            string user = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
+            string xml =
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n" +
+                "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n" +
+                "  <Principals><Principal id=\"Author\"><UserId>" + System.Security.SecurityElement.Escape(user) + "</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n" +
+                "  <Settings>\r\n" +
+                "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n" +
+                "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n" +
+                "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n" +
+                "    <AllowHardTerminate>false</AllowHardTerminate>\r\n" +
+                "    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n" +
+                "    <Enabled>true</Enabled>\r\n" +
+                "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n" +
+                "    <Priority>4</Priority>\r\n" +
+                "  </Settings>\r\n" +
+                "  <Actions Context=\"Author\"><Exec><Command>\"" + System.Security.SecurityElement.Escape(explorer) + "\"</Command></Exec></Actions>\r\n" +
+                "</Task>\r\n";
+            Paths.EnsureDataDir();
+            string file = Path.Combine(Paths.DataDir, "explorer-task.xml");
+            try
+            {
+                File.WriteAllText(file, xml, System.Text.Encoding.Unicode);
+                Shell.Run(Paths.System32("schtasks.exe"), "/Create /TN " + task + " /XML \"" + file + "\" /F", 15000);
+                Shell.Run(Paths.System32("schtasks.exe"), "/Run /TN " + task, 15000);
+                System.Threading.Thread.Sleep(2000);
+            }
+            finally
+            {
+                Shell.Run(Paths.System32("schtasks.exe"), "/Delete /TN " + task + " /F", 15000);
+                try { File.Delete(file); } catch { }
+            }
         }
 
         static bool ExplorerRunning(int session)

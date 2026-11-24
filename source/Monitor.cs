@@ -185,8 +185,8 @@ namespace QuietPC
                         item.Title = Friendly.Title(name, path);
                         item.Why = Friendly.Why(name);
                         // Only your own apps: not Windows' own programs, not services, not other users' programs.
-                        item.CanEnd = !Friendly.IsProtected(name) &&
-                                      !(path ?? "").StartsWith(WinDir, StringComparison.OrdinalIgnoreCase);
+                        item.CanEnd = !Friendly.IsProtected(name) && !string.IsNullOrEmpty(path) &&
+                                      !path.StartsWith(WinDir, StringComparison.OrdinalIgnoreCase);
                         groups[name] = item;
                     }
                     item.Cpu += percent;

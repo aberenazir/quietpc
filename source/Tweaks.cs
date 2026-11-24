@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
@@ -229,6 +230,12 @@ namespace QuietPC
             Shell.Run(Paths.System32("powercfg.exe"), "/setactive SCHEME_CURRENT", 15000);
         }
 
+        static bool PlanExists(string scheme)
+        {
+            Shell.Result r = Shell.Run(Paths.System32("powercfg.exe"), "/list", 15000);
+            return !r.Ok || r.Output.IndexOf(scheme, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         public override bool IsOn()
         {
             string scheme = ActiveScheme();
@@ -281,6 +288,7 @@ namespace QuietPC
                 int value;
                 if (!int.TryParse(original, NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) continue;
                 if (Write(p[0], s, value)) Backup.Remove(key);
+                else if (!PlanExists(p[0])) { Backup.Remove(key); Log.Write("power plan no longer exists, nothing to undo: " + key); }
                 else Log.Write("power revert failed, keeping the original for later: " + key);
             }
             Activate();
@@ -533,10 +541,28 @@ namespace QuietPC
 
         public override void Apply()
         {
-            object enabled = Reg.Read(RegistryHive.LocalMachine, @"SYSTEM\CurrentControlSet\Control\Power", "HibernateEnabled");
-            Backup.SaveOnce(HibKey, enabled is int && (int)enabled == 0 ? "off" : "on");
-            Shell.Run(Paths.System32("powercfg.exe"), "/hibernate on", 30000);
+            bool wasOn = HibernateOn();
+            Backup.SaveOnce(HibKey, wasOn ? "on" : "off");
+            if (!wasOn)
+            {
+                Shell.Run(Paths.System32("powercfg.exe"), "/hibernate on", 30000);
+                if (!HibernateOn())
+                {
+                    Backup.Remove(HibKey);
+                    throw new Exception("This laptop can't hibernate, so closing the lid was left as it is.");
+                }
+            }
             base.Apply();
+        }
+
+        static bool HibernateOn()
+        {
+            const string power = @"SYSTEM\CurrentControlSet\Control\Power";
+            object v = Reg.Read(RegistryHive.LocalMachine, power, "HibernateEnabled");
+            if (v == null) v = Reg.Read(RegistryHive.LocalMachine, power, "HibernateEnabledDefault");
+            if (v is int) return (int)v != 0;
+            string drive = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows)) ?? @"C:\";
+            return File.Exists(Path.Combine(drive, "hiberfil.sys"));
         }
 
         public override void Revert()
@@ -811,6 +837,12 @@ namespace QuietPC
         public static List<string> UndoEverything(Action<string> progress)
         {
             List<string> failed = new List<string>();
+            try { Backup.EnsureReadable(); }
+            catch
+            {
+                failed.Add("Everything: QuietPC couldn't read its undo list right now (it's kept safe for another try)");
+                return failed;
+            }
             foreach (Tweak t in Catalog.All)
             {
                 if (!t.HasBackup()) continue;

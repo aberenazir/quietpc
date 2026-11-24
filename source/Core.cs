@@ -391,6 +391,12 @@ namespace QuietPC
             }
         }
 
+        // Throws if the undo list exists but can't be read.
+        public static void EnsureReadable()
+        {
+            lock (gate) LoadOrThrow();
+        }
+
         public static int Count
         {
             get { return KeysWithPrefix("").Count; }

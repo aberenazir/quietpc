@@ -64,8 +64,8 @@ namespace QuietPC
             Paths.EnsureDataDir();
             string dir = Path.Combine(Paths.DataDir, "update");
             Directory.CreateDirectory(dir);
+            foreach (string old in Directory.GetFiles(dir, "*.exe")) { try { File.Delete(old); } catch { } }
             string path = Path.Combine(dir, "QuietPC-Setup-" + info.Version + ".exe");
-            if (File.Exists(path)) File.Delete(path);
             using (WebClient wc = NewClient()) wc.DownloadFile(AppInfo.SetupUrl(info.Version), path);
             using (FileStream fs = File.OpenRead(path))
             {
